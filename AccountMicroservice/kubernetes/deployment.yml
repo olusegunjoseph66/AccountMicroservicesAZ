@@ -1,0 +1,41 @@
+apiVersion : apps/v1
+kind: Deployment
+metadata:
+  name: accountmicroservice
+  labels:
+    app: accountmicroservice
+spec:
+  replicas: #replicaNo#
+  selector:
+    matchLabels:
+      app: accountmicroservice
+  template:
+    metadata:
+      labels:
+        app: accountmicroservice
+    spec:
+      containers:
+        - name: accountmicroservice
+          env:
+          - name: COMPlus_EnableDiagnostics
+            value: "0"
+          image: #image#
+          imagePullPolicy: IfNotPresent
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "100m"
+            limits:
+              memory: "640Mi"
+              cpu: "250m"
+          ports:
+            - containerPort: 8080
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+      imagePullSecrets:
+        - name: #acrsecret#
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001

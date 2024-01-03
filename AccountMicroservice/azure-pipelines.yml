@@ -1,0 +1,729 @@
+trigger:
+- develop
+# - staging
+# - release
+# - main
+
+resources:
+- repo: self
+
+parameters:
+  - name: Environment
+    displayName: Which environment do you want to deploy to?
+    type: string
+    default: 'Development'
+    values:
+    - Development
+    - Staging
+    - Production
+
+variables:
+  tag: '$(Build.BuildId)'
+  imageRepo: 'accountmicroservice'
+  acrStaging: 'dangotedmsimagesdev.azurecr.io'
+  acrProduction: 'dangotedmsimages.azurecr.io'
+  registryStaging: 'DR DMS SC UP DEV'
+  registryProduction: 'DR DMS SC UP'
+  azureSubscription: 'DMS ARM SC NRG'
+  kubernetesServiceConnectionStaging: 'DMS K8S SC DEV'
+  kubernetesServiceConnectionProduction: 'DMS K8S SC PROD'
+  k8sNamespace: 'microservices'
+  vmImageName: 'aks-deployment-jumpbox'
+  DevAppConfigurationEndpoint: https://dms-development.azconfig.io
+  StagingAppConfigurationEndpoint: https://dms-app-config-staging.azconfig.io
+  ProductionAppConfigurationEndpoint: https://dms-app-config-production.azconfig.io
+  dev-url: https://dms-account-ms.azurewebsites.net
+  staging-ip: 10.224.0.25
+  staging-url: http://$(staging-ip):8080
+  production-ip: 172.16.109.25
+  production-url: http://$(production-ip):8080
+  poll-time: 10s
+  targetapi: 'account-microservice-webapi'
+  apiDisplayName: 'Account Microservice - WebApi'
+  pathapi: 'account'
+  MicrosoftApiManagementAPIVersion: '2017-03-01'
+  sonarqubeprojectKey: 'Dangote_Management_System__DMS__AccountMicroservice_AYVecZ8j5RfU06GU7yBd'
+  sonarqubehost: https://dms-sonar.azurewebsites.net
+  SonarKey: $(SonarQubeKey)
+
+stages:
+
+- stage: Build
+  condition: ne(variables['Build.SourceBranch'], 'refs/heads/develop')
+  jobs:
+  - job: Build_APP
+    pool: windows
+
+    workspace:
+      clean: all
+
+    variables:
+      solution: '**/*.sln'
+      buildPlatform: 'Any CPU'
+      buildConfiguration: 'Release'
+
+    steps:
+    - checkout: self
+      clean: "true"
+      fetchDepth: "0"
+      displayName: Checkout
+
+    - script: |
+        git gc --prune=all && git repack -a -f -F -d
+      displayName: Cleanup old history
+
+    - task: UseDotNet@2
+      displayName: 'Install .NET Core SDK'
+      inputs:
+        packageType: 'sdk'
+        version: '6.0.x'
+      
+    - task: NodeTool@0
+      displayName: 'Install nodejs'
+      inputs:
+        versionSource: 'spec'
+        versionSpec: '18.x'
+        checkLatest: true
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Restore tools'
+      inputs:
+        command: custom
+        custom: tool
+        arguments: restore --tool-manifest $(Build.SourcesDirectory)/.config/dotnet-tools.json
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Prepare Code Analysis'
+      inputs:
+        command: custom
+        custom: dotnet-sonarscanner
+        arguments: begin /k:$(sonarqubeprojectKey) /d:sonar.host.url=$(sonarqubehost) /d:sonar.login=$(SonarKey)
+        workingDirectory: $(Build.SourcesDirectory)
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Build APP'
+      inputs:
+        command: build
+        projects: $(Build.SourcesDirectory)/**/*.csproj
+        arguments: -c Release
+
+    - task: DotNetCoreCLI@2
+      displayName: Run Unit tests
+      inputs:
+        command: test
+        projects: $(Build.SourcesDirectory)/**/*.csproj
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Run code analysis'
+      inputs:
+        command: custom
+        custom: dotnet-sonarscanner
+        arguments: end /d:sonar.login=$(SonarKey)
+        workingDirectory: $(Build.SourcesDirectory)
+
+    - task: AzureAppConfiguration@5
+      displayName: Fetch configs
+      inputs:
+        azureSubscription: $(azureSubscription)
+        AppConfigurationEndpoint: $(DevAppConfigurationEndpoint)
+        KeyFilter: '*'
+
+    - task: replacetokens@3
+      displayName: Apply configs and secrets
+      inputs:
+        rootDirectory: '$(System.DefaultWorkingDirectory)'
+        targetFiles: '**\appsettings.json'
+        encoding: 'auto'
+        writeBOM: true
+        actionOnMissing: 'fail'
+        keepToken: false
+        tokenPrefix: '#['
+        tokenSuffix: ']#'
+        useLegacyPattern: false
+        enableTransforms: false
+        enableTelemetry: false
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Publish APP'
+      inputs:
+        command: publish
+        projects: $(Build.SourcesDirectory)/Account.API/*.csproj
+        publishWebProjects: false
+        arguments: -c Release -o $(build.ArtifactStagingDirectory)
+        zipAfterPublish: True
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Generate Swagger v1 specifications'
+      inputs:
+        command: custom
+        custom: swagger
+        arguments: tofile --host $(dev-url) --output $(Build.ArtifactStagingDirectory)/swagger.json $(Build.SourcesDirectory)/Account.API/bin/Release/net6.0/Account.API.dll v1
+        workingDirectory: $(Build.SourcesDirectory)/Account.API
+
+  - job: Build_Image_And_scan
+    dependsOn: Build_APP
+    pool: $(vmImageName)
+    workspace:
+      clean: all
+    steps:
+    - task: CmdLine@2
+      displayName: Build image
+      inputs:
+        script: 'docker build -t $(imageRepo):$(tag) -f $(Build.SourcesDirectory)/Dockerfile .'
+
+    - task: CmdLine@2
+      displayName: Scan image for vulnerabilities
+      inputs:
+        script: |
+          # docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+          # -v $HOME/Library/Caches:/root/.cache/ aquasec/trivy --cache-dir .trivycache/ \
+          # image --exit-code 1 --severity MEDIUM,HIGH --ignore-unfixed $(imageRepo):$(tag)
+          # the exit-code needs to be updated to fix vulnerabilities
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+          -v $HOME/Library/Caches:/root/.cache/ aquasec/trivy --cache-dir .trivycache/ \
+          image --exit-code 1 --severity MEDIUM,HIGH,CRITICAL --vuln-type library --ignore-unfixed $(imageRepo):$(tag)
+
+    - task: CmdLine@2
+      displayName: Cleanup built image
+      inputs:
+        script: 'docker rmi $(imageRepo):$(tag)'
+
+- stage: Development
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/develop'), eq('${{parameters.environment}}', 'Development'))
+  jobs:
+  - deployment: Development
+    environment: Development
+    displayName: Development
+    pool: $(vmImageName)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: none # skip unnecessary downloads of artifacts
+
+          - checkout: self
+            clean: "true"
+
+          - script: |
+              git gc --prune=all && git repack -a -f -F -d
+            displayName: Cleanup old history
+
+          - task: AzureAppConfiguration@5
+            displayName: Fetch configs
+            inputs:
+              azureSubscription: $(azureSubscription)
+              AppConfigurationEndpoint: $(DevAppConfigurationEndpoint)
+              KeyFilter: '*'
+
+          - task: replacetokens@3
+            displayName: Apply configs and secrets
+            inputs:
+              rootDirectory: '$(System.DefaultWorkingDirectory)'
+              targetFiles: '**\appsettings.json'
+              encoding: 'auto'
+              writeBOM: true
+              actionOnMissing: 'fail'
+              keepToken: false
+              tokenPrefix: '#['
+              tokenSuffix: ']#'
+              useLegacyPattern: false
+              enableTransforms: false
+              enableTelemetry: false
+
+          - task: UseDotNet@2
+            displayName: 'Install .NET Core SDK'
+            inputs:
+              packageType: 'sdk'
+              version: '6.0.x'
+
+          - task: DotNetCoreCLI@2
+            displayName: 'Restore tools'
+            inputs:
+              command: custom
+              custom: tool
+              arguments: restore --tool-manifest $(Build.SourcesDirectory)/.config/dotnet-tools.json
+
+          - task: DotNetCoreCLI@2
+            displayName: 'Publish APP'
+            inputs:
+              command: publish
+              projects: $(Build.SourcesDirectory)/Account.API/*.csproj
+              publishWebProjects: false
+              arguments: -c Release -o $(build.ArtifactStagingDirectory)
+              zipAfterPublish: True
+
+          - task: DotNetCoreCLI@2
+            displayName: 'Generate Swagger v1 specifications'
+            inputs:
+              command: custom
+              custom: swagger
+              arguments: tofile --host $(dev-url) --output $(Build.ArtifactStagingDirectory)/swagger.json $(Build.SourcesDirectory)/Account.API/bin/Release/net6.0/Account.API.dll v1
+              workingDirectory: $(Build.SourcesDirectory)/Account.API
+
+          - task: AzureRmWebAppDeployment@4
+            displayName: Deploy to development
+            inputs:
+              ConnectionType: 'AzureRM'
+              azureSubscription: $(azureSubscription)
+              ResourceGroupName: 'development'
+              appType: 'webApp'
+              WebAppName: 'dms-account-ms'
+              packageForLinux: '$(build.ArtifactStagingDirectory)/*.zip'
+
+          - task: CmdLine@2
+            displayName: Confirm site is up
+            inputs:
+              script: |
+                sleep $(poll-time)
+                curl -sSf $(dev-url) > /dev/null
+              failOnStderr: true
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish swagger.json Artifact'
+            inputs:
+              pathToPublish: '$(Build.ArtifactStagingDirectory)/swagger.json'
+              artifactName: 'drop'
+              publishLocation: 'Container'
+
+  - job: Sync_api_gateway_specifications
+    dependsOn: Development
+    condition: succeeded()
+    pool: windows
+    workspace:
+      clean: all
+    steps:
+    - checkout: none # skip checking out the repository
+
+    - task: DownloadBuildArtifacts@0
+      displayName: Download build artifact
+      inputs:
+        buildType: 'current'
+        downloadType: 'single'
+        artifactName: 'drop'
+        itemPattern:
+        downloadPath: '$(System.ArtifactsDirectory)'
+        cleanDestinationFolder: true
+
+    - task: apim@5
+      displayName: Update API specifications
+      inputs:
+        ConnectedServiceNameARM: $(azureSubscription)
+        ResourceGroupName: 'Development'
+        ApiPortalName: 'dms-dev-microservices-apim'
+        OpenAPISpec: 'v1'
+        Authorization: 'None'
+        SwaggerPicker: 'Artifact'
+        swaggerartifact: '$(System.ArtifactsDirectory)/drop/swagger.json'
+        targetapi: $(targetapi)
+        DisplayName: $(apiDisplayName)
+        pathapi: $(pathapi)
+        subscriptionRequired: false
+        MicrosoftApiManagementAPIVersion: $(MicrosoftApiManagementAPIVersion)
+
+- stage: Staging
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/develop'), eq('${{parameters.environment}}', 'Staging'))
+  jobs:
+  - deployment: Staging
+    environment: Staging
+    displayName: Staging
+    pool: $(vmImageName)
+    workspace:
+      clean: all
+    variables:
+      acrsecret: k8sacrauth
+      acrurl: 'dangotedmsimagesdev.azurecr.io'
+      replicaNo: 1
+      loadBalancerIP: $(staging-ip)
+      image: '$(acrurl)/$(imageRepo):$(tag)'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: none # skip unnecessary downloads of artifacts
+
+          - checkout: self
+            clean: "true"
+
+          - script: |
+              git gc --prune=all && git repack -a -f -F -d
+            displayName: Cleanup old history
+
+          - task: AzureAppConfiguration@5
+            displayName: Fetch configs
+            inputs:
+              azureSubscription: $(azureSubscription)
+              AppConfigurationEndpoint: $(StagingAppConfigurationEndpoint)
+              KeyFilter: '*'
+
+          - task: replacetokens@3
+            displayName: Apply configs and secrets
+            inputs:
+              rootDirectory: '$(System.DefaultWorkingDirectory)'
+              targetFiles: '**\appsettings.json'
+              encoding: 'auto'
+              writeBOM: true
+              actionOnMissing: 'fail'
+              keepToken: false
+              tokenPrefix: '#['
+              tokenSuffix: ']#'
+              useLegacyPattern: false
+              enableTransforms: false
+              enableTelemetry: false
+
+          - task: UseDotNet@2
+            displayName: 'Install .NET Core SDK'
+            inputs:
+              packageType: 'sdk'
+              version: '6.0.x'
+
+          - task: DotNetCoreCLI@2
+            displayName: 'Restore tools'
+            inputs:
+              command: custom
+              custom: tool
+              arguments: restore --tool-manifest $(Build.SourcesDirectory)/.config/dotnet-tools.json
+
+          - task: DotNetCoreCLI@2
+            displayName: 'Publish APP'
+            inputs:
+              command: publish
+              projects: $(Build.SourcesDirectory)/Account.API/*.csproj
+              publishWebProjects: false
+              arguments: -c Release -o $(build.ArtifactStagingDirectory)
+              zipAfterPublish: True
+
+          - task: DotNetCoreCLI@2
+            displayName: 'Generate Swagger v1 specifications'
+            inputs:
+              command: custom
+              custom: swagger
+              arguments: tofile --host $(staging-url) --output $(Build.ArtifactStagingDirectory)/swagger.json $(Build.SourcesDirectory)/Account.API/bin/Release/net6.0/Account.API.dll v1
+              workingDirectory: $(Build.SourcesDirectory)/Account.API
+
+          - task: Docker@2
+            displayName: Build image
+            inputs:
+              containerRegistry: $(registryStaging)
+              repository: $(imageRepo)
+              command: 'build'
+              Dockerfile: '$(Build.SourcesDirectory)/Dockerfile'
+              tags: |
+                $(tag)
+
+          - task: Docker@2
+            displayName: Push built image
+            inputs:
+              containerRegistry: $(registryStaging)
+              repository: $(imageRepo)
+              command: 'Push'
+              tags: |
+                $(tag)
+
+          - task: CmdLine@2
+            displayName: Cleanup built docker image
+            inputs:
+              script: 'docker rmi $(acrStaging)/$(imageRepo):$(tag)'
+
+          - task: KubernetesManifest@0
+            displayName: Create secret
+            inputs:
+              action: 'createSecret'
+              kubernetesServiceConnection: $(kubernetesServiceConnectionStaging)
+              namespace: $(k8sNamespace)
+              secretType: 'dockerRegistry'
+              secretName: '$(acrsecret)'
+              dockerRegistryEndpoint: '$(registryStaging)'
+
+          - task: replacetokens@3
+            displayName: Replace replicaNo, image and acrsecret
+            inputs:
+              rootDirectory: '$(Pipeline.Workspace)/s/kubernetes/'
+              targetFiles: 'deployment.yml'
+              encoding: 'auto'
+              writeBOM: true
+              actionOnMissing: 'fail'
+              keepToken: false
+              tokenPrefix: '#'
+              tokenSuffix: '#'
+              useLegacyPattern: false
+              enableTransforms: false
+              enableTelemetry: false
+
+          - task: replacetokens@3
+            displayName: Replace loadBalancerIP
+            inputs:
+              rootDirectory: '$(Pipeline.Workspace)/s/kubernetes/'
+              targetFiles: 'service.yml'
+              encoding: 'auto'
+              writeBOM: true
+              actionOnMissing: 'fail'
+              keepToken: false
+              tokenPrefix: '#'
+              tokenSuffix: '#'
+              useLegacyPattern: false
+              enableTransforms: false
+              enableTelemetry: false
+
+          - task: KubernetesManifest@0
+            displayName: Deploy
+            inputs:
+              action: 'deploy'
+              kubernetesServiceConnection: $(kubernetesServiceConnectionStaging)
+              namespace: $(k8sNamespace)
+              manifests: |
+                $(Pipeline.Workspace)/s/kubernetes/deployment.yml
+                $(Pipeline.Workspace)/s/kubernetes/service.yml
+
+          - task: CmdLine@2
+            displayName: Confirm site is up
+            inputs:
+              script: |
+                sleep $(poll-time)
+                curl -sSf $(staging-url) > /dev/null
+              failOnStderr: true
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish swagger.json Artifact'
+            inputs:
+              pathToPublish: '$(Build.ArtifactStagingDirectory)/swagger.json'
+              artifactName: 'drop'
+              publishLocation: 'Container'
+
+  - job: Sync_api_gateway_specifications
+    dependsOn: Staging
+    condition: succeeded()
+    pool: windows
+    workspace:
+      clean: all
+    steps:
+    - checkout: none # skip checking out the repository
+
+    - task: DownloadBuildArtifacts@0
+      displayName: Download build artifact
+      inputs:
+        buildType: 'current'
+        downloadType: 'single'
+        artifactName: 'drop'
+        itemPattern:
+        downloadPath: '$(System.ArtifactsDirectory)'
+        cleanDestinationFolder: true
+
+    - task: apim@5
+      displayName: Update API specifications
+      inputs:
+        ConnectedServiceNameARM: $(azureSubscription)
+        ResourceGroupName: 'staging'
+        ApiPortalName: 'dms-staging-microservices-apim'
+        OpenAPISpec: 'v1'
+        Authorization: 'None'
+        SwaggerPicker: 'Artifact'
+        swaggerartifact: '$(System.ArtifactsDirectory)/drop/swagger.json'
+        targetapi: $(targetapi)
+        DisplayName: $(apiDisplayName)
+        pathapi: $(pathapi)
+        subscriptionRequired: false
+        MicrosoftApiManagementAPIVersion: $(MicrosoftApiManagementAPIVersion)
+
+- stage: Production
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/develop'), eq('${{parameters.environment}}', 'Production'))
+  jobs:
+  - deployment: Production
+    environment: Production
+    displayName: Production
+    pool: 'aks-deployment-jumpbox-prod'
+    workspace:
+      clean: all
+    variables:
+      acrsecret: k8sacrauth
+      acrurl: 'dangotedmsimages.azurecr.io'
+      replicaNo: 1
+      loadBalancerIP: $(production-ip)
+      image: '$(acrurl)/$(imageRepo):$(tag)'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: none # skip unnecessary downloads of artifacts
+
+          - checkout: self
+            clean: "true"
+
+          - script: |
+              git gc --prune=all && git repack -a -f -F -d
+            displayName: Cleanup old history
+
+          - task: AzureAppConfiguration@5
+            displayName: Fetch configs
+            inputs:
+              azureSubscription: $(azureSubscription)
+              AppConfigurationEndpoint: $(ProductionAppConfigurationEndpoint)
+              KeyFilter: '*'
+
+          - task: replacetokens@3
+            displayName: Apply configs and secrets
+            inputs:
+              rootDirectory: '$(System.DefaultWorkingDirectory)'
+              targetFiles: '**\appsettings.json'
+              encoding: 'auto'
+              writeBOM: true
+              actionOnMissing: 'fail'
+              keepToken: false
+              tokenPrefix: '#['
+              tokenSuffix: ']#'
+              useLegacyPattern: false
+              enableTransforms: false
+              enableTelemetry: false
+
+          - task: UseDotNet@2
+            displayName: 'Install .NET Core SDK'
+            inputs:
+              packageType: 'sdk'
+              version: '6.0.x'
+
+          - task: DotNetCoreCLI@2
+            displayName: 'Restore tools'
+            inputs:
+              command: custom
+              custom: tool
+              arguments: restore --tool-manifest $(Build.SourcesDirectory)/.config/dotnet-tools.json
+
+          - task: DotNetCoreCLI@2
+            displayName: 'Publish APP'
+            inputs:
+              command: publish
+              projects: $(Build.SourcesDirectory)/Account.API/*.csproj
+              publishWebProjects: false
+              arguments: -c Release -o $(build.ArtifactStagingDirectory)
+              zipAfterPublish: True
+
+          - task: DotNetCoreCLI@2
+            displayName: 'Generate Swagger v1 specifications'
+            inputs:
+              command: custom
+              custom: swagger
+              arguments: tofile --host $(production-url) --output $(Build.ArtifactStagingDirectory)/swagger.json $(Build.SourcesDirectory)/Account.API/bin/Release/net6.0/Account.API.dll v1
+              workingDirectory: $(Build.SourcesDirectory)/Account.API
+
+          - task: Docker@2
+            displayName: Build image
+            inputs:
+              containerRegistry: $(registryProduction)
+              repository: $(imageRepo)
+              command: 'build'
+              Dockerfile: '$(Build.SourcesDirectory)/Dockerfile'
+              tags: |
+                $(tag)
+
+          - task: Docker@2
+            displayName: Push built image
+            inputs:
+              containerRegistry: $(registryProduction)
+              repository: $(imageRepo)
+              command: 'Push'
+              tags: |
+                $(tag)
+
+          - task: CmdLine@2
+            displayName: Cleanup built docker image
+            inputs:
+              script: 'docker rmi $(acrProduction)/$(imageRepo):$(tag)'
+
+          - task: KubernetesManifest@0
+            displayName: Create secret
+            inputs:
+              action: 'createSecret'
+              kubernetesServiceConnection: $(kubernetesServiceConnectionProduction)
+              namespace: $(k8sNamespace)
+              secretType: 'dockerRegistry'
+              secretName: '$(acrsecret)'
+              dockerRegistryEndpoint: '$(registryProduction)'
+
+          - task: replacetokens@3
+            displayName: Replace replicaNo, image and acrsecret
+            inputs:
+              rootDirectory: '$(Pipeline.Workspace)/s/kubernetes/'
+              targetFiles: 'deployment.yml'
+              encoding: 'auto'
+              writeBOM: true
+              actionOnMissing: 'fail'
+              keepToken: false
+              tokenPrefix: '#'
+              tokenSuffix: '#'
+              useLegacyPattern: false
+              enableTransforms: false
+              enableTelemetry: false
+
+          - task: replacetokens@3
+            displayName: Replace loadBalancerIP
+            inputs:
+              rootDirectory: '$(Pipeline.Workspace)/s/kubernetes/'
+              targetFiles: 'service.yml'
+              encoding: 'auto'
+              writeBOM: true
+              actionOnMissing: 'fail'
+              keepToken: false
+              tokenPrefix: '#'
+              tokenSuffix: '#'
+              useLegacyPattern: false
+              enableTransforms: false
+              enableTelemetry: false
+
+          - task: KubernetesManifest@0
+            displayName: Deploy
+            inputs:
+              action: 'deploy'
+              kubernetesServiceConnection: $(kubernetesServiceConnectionProduction)
+              namespace: $(k8sNamespace)
+              manifests: |
+                $(Pipeline.Workspace)/s/kubernetes/deployment.yml
+                $(Pipeline.Workspace)/s/kubernetes/service.yml
+
+          - task: CmdLine@2
+            displayName: Confirm site is up
+            inputs:
+              script: |
+                sleep $(poll-time)
+                curl -sSf $(production-url) > /dev/null
+              failOnStderr: true
+          
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish swagger.json Artifact'
+            inputs:
+              pathToPublish: '$(Build.ArtifactStagingDirectory)/swagger.json'
+              artifactName: 'drop'
+              publishLocation: 'Container'
+
+  - job: Sync_api_gateway_specifications
+    dependsOn: Production
+    condition: succeeded()
+    pool: windows
+    workspace:
+      clean: all
+    steps:
+    - checkout: none # skip checking out the repository
+
+    - task: DownloadBuildArtifacts@0
+      displayName: Download build artifact
+      inputs:
+        buildType: 'current'
+        downloadType: 'single'
+        artifactName: 'drop'
+        itemPattern:
+        downloadPath: '$(System.ArtifactsDirectory)'
+        cleanDestinationFolder: true
+
+    - task: apim@5
+      displayName: Update API specifications
+      inputs:
+        ConnectedServiceNameARM: $(azureSubscription)
+        ResourceGroupName: 'production'
+        ApiPortalName: 'dms-prod-microservices-apim'
+        OpenAPISpec: 'v1'
+        Authorization: 'None'
+        SwaggerPicker: 'Artifact'
+        swaggerartifact: '$(System.ArtifactsDirectory)/drop/swagger.json'
+        targetapi: $(targetapi)
+        DisplayName: $(apiDisplayName)
+        pathapi: $(pathapi)
+        subscriptionRequired: false
+        MicrosoftApiManagementAPIVersion: $(MicrosoftApiManagementAPIVersion)
